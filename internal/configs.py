@@ -164,6 +164,10 @@ class Config:
   # For raw test scenes, use affine raw-space color correction.
   eval_raw_affine_cc: bool = False
 
+  #model 3
+  lambda_loss_mult: float = 0.01
+  beta_min : float= 0.03
+  rho = 0.5
 
 def define_common_flags():
   # Define the flags used by both train.py and eval.py
