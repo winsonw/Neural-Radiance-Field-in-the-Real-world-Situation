@@ -71,6 +71,9 @@ class Model(nn.Module):
   use_gpu_resampling: bool = False  # Use gather ops for faster GPU resampling.
   opaque_background: bool = False  # If true, make the background opaque.
 
+  num_trans_features: int = 0  # GLO vector length, disabled if 0.
+  num_trans_embeddings: int = 1000  # Upper bound on max number of train images.
+
   @nn.compact
   def __call__(
       self,
@@ -104,21 +107,14 @@ class Model(nn.Module):
         glo_vecs = nn.Embed(self.num_glo_embeddings, self.num_glo_features)
         cam_idx = rays.cam_idx[..., 0]
         glo_vec = glo_vecs(cam_idx)
+        trans_embed_layer = nn.Embed(self.num_trans_embeddings, self.num_trans_features)
+        trans_vec = trans_embed_layer(cam_idx)
       else:
         glo_vec = jnp.zeros(rays.origins.shape[:-1] + (self.num_glo_features,))
+        trans_vec = jnp.zeros(rays.origins.shape[:-1] + (self.num_trans_features,))
     else:
       glo_vec = None
-
-    if self.learned_exposure_scaling:
-      # Setup learned scaling factors for output colors.
-      max_num_exposures = self.num_glo_embeddings
-      # Initialize the learned scaling offsets at 0.
-      init_fn = jax.nn.initializers.zeros
-      exposure_scaling_offsets = nn.Embed(
-          max_num_exposures,
-          features=3,
-          embedding_init=init_fn,
-          name='exposure_scaling_offsets')
+      trans_vec = None
 
     # Define the mapping from normalized to metric ray distance.
     _, s_to_t = coord.construct_ray_warps(self.raydist_fn, rays.near, rays.far)
@@ -226,16 +222,27 @@ class Model(nn.Module):
           viewdirs=rays.viewdirs if self.use_viewdirs else None,
           imageplane=rays.imageplane,
           glo_vec=None if is_prop else glo_vec,
+          trans_vec=None if is_prop else trans_vec,
           exposure=rays.exposure_values,
       )
 
       # Get the weights used by volumetric rendering (and our other losses).
-      weights = render.compute_alpha_weights(
+      if not is_prop:
+        weights, t_weights = render.compute_two_alpha_weights(
+          ray_results['density'],
+          ray_results['transient']['density'],
+          tdist,
+          rays.directions,
+          opaque_background=self.opaque_background,
+          )[:-1]
+      else:
+        weights = render.compute_alpha_weights(
           ray_results['density'],
           tdist,
           rays.directions,
           opaque_background=self.opaque_background,
-      )[0]
+        )[0]
+        t_weights= None
 
       # Define or sample the background color for each ray.
       if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
@@ -253,23 +260,11 @@ class Model(nn.Module):
             minval=self.bg_intensity_range[0],
             maxval=self.bg_intensity_range[1])
 
-      # RawNeRF exposure logic.
-      if rays.exposure_idx is not None:
-        # Scale output colors by the exposure.
-        ray_results['rgb'] *= rays.exposure_values[..., None, :]
-        if self.learned_exposure_scaling:
-          exposure_idx = rays.exposure_idx[..., 0]
-          # Force scaling offset to always be zero when exposure_idx is 0.
-          # This constraint fixes a reference point for the scene's brightness.
-          mask = exposure_idx > 0
-          # Scaling is parameterized as an offset from 1.
-          scaling = 1 + mask[..., None] * exposure_scaling_offsets(exposure_idx)
-          ray_results['rgb'] *= scaling[..., None, :]
-
       # Render each ray.
       rendering = render.volumetric_rendering(
           ray_results['rgb'],
           weights,
+          t_weights,
           tdist,
           bg_rgbs,
           rays.far,
@@ -278,7 +273,10 @@ class Model(nn.Module):
               k: v
               for k, v in ray_results.items()
               if k.startswith('normals') or k in ['roughness']
-          })
+          },
+          compute_transient=not is_prop,
+          t_rgbs=None if is_prop else ray_results['transient']['rgb'],
+      )
 
       if compute_extras:
         # Collect some rays to visualize directly. By naming these quantities
@@ -294,6 +292,7 @@ class Model(nn.Module):
       renderings.append(rendering)
       ray_results['sdist'] = jnp.copy(sdist)
       ray_results['weights'] = jnp.copy(weights)
+      ray_results['t_weights'] = jnp.copy(t_weights)
       ray_history.append(ray_results)
 
     if compute_extras:
@@ -377,6 +376,9 @@ class MLP(nn.Module):
   warp_fn: Callable[..., Any] = None
   basis_shape: str = 'icosahedron'  # `octahedron` or `icosahedron`.
   basis_subdivisions: int = 2  # Tesselation count. 'octahedron' + 1 == eye(3).
+  net_depth_trans: int = 4
+  net_width_trans: int = 128
+  beta_activation: Callable[..., Any] = nn.softplus  # The RGB activation.
 
   def setup(self):
     # Make sure that normals are computed if reflection direction is used.
@@ -406,6 +408,7 @@ class MLP(nn.Module):
                viewdirs=None,
                imageplane=None,
                glo_vec=None,
+               trans_vec=None,
                exposure=None):
     """Evaluate the MLP.
 
@@ -506,6 +509,7 @@ class MLP(nn.Module):
     density = self.density_activation(raw_density + self.density_bias)
 
     roughness = None
+    transient = dict()
     if self.disable_rgb:
       rgb = jnp.zeros_like(means)
     else:
@@ -533,8 +537,42 @@ class MLP(nn.Module):
                 key, bottleneck.shape)
 
           x = [bottleneck]
+          z = [bottleneck]
         else:
           x = []
+          z = []
+
+        if trans_vec is not None:
+          trans_vec = jnp.broadcast_to(trans_vec[..., None, :],
+                                     bottleneck.shape[:-1] + trans_vec.shape[-1:])
+          z.append(trans_vec)
+
+        z = jnp.concatenate(z, axis=-1)
+
+        # Output of the second part of MLP.
+        inputs = z
+        for i in range(self.net_depth_trans):
+          z = dense_layer(self.net_width_trans)(z)
+          z = self.net_activation(z)
+          if i % self.skip_layer_dir == 0 and i > 0:
+            z = jnp.concatenate([x, inputs], axis=-1)
+
+        t_raw_density = dense_layer(1)(z)[..., 0]
+        if (density_key is not None) and (self.density_noise > 0):
+            t_raw_density += self.density_noise * random.normal(density_key, t_raw_density.shape)
+
+        t_density = self.density_activation(t_raw_density + self.density_bias)
+
+        t_radiance = self.rgb_activation(self.rgb_premultiplier *
+                                dense_layer(self.num_rgb_channels)(z) +
+                                self.rgb_bias)
+
+        t_radiance = t_radiance * (1 + 2 * self.rgb_padding) - self.rgb_padding
+
+        beta = dense_layer(1)(z)[..., 0]
+        beta = self.beta_activation(beta)
+
+        transient.update({'density': t_density, 'rgb': t_radiance, 'beta': beta})
 
         # Encode view (or reflection) directions.
         if self.use_reflections:
@@ -585,19 +623,6 @@ class MLP(nn.Module):
                                 dense_layer(self.num_rgb_channels)(x) +
                                 self.rgb_bias)
 
-      if self.use_diffuse_color:
-        # Initialize linear diffuse color around 0.25, so that the combined
-        # linear color is initialized around 0.5.
-        diffuse_linear = nn.sigmoid(raw_rgb_diffuse - jnp.log(3.0))
-        if self.use_specular_tint:
-          specular_linear = tint * rgb
-        else:
-          specular_linear = 0.5 * rgb
-
-        # Combine specular and diffuse components and tone map to sRGB.
-        rgb = jnp.clip(
-            image.linear_to_srgb(specular_linear + diffuse_linear), 0.0, 1.0)
-
       # Apply padding, mapping color to [-rgb_padding, 1+rgb_padding].
       rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
 
@@ -609,6 +634,7 @@ class MLP(nn.Module):
         normals=normals,
         normals_pred=normals_pred,
         roughness=roughness,
+        transient=transient,
     )
 
 
