@@ -151,13 +151,50 @@ def compute_alpha_weights(density, tdist, dirs, opaque_background=False):
   return weights, alpha, trans
 
 
+def compute_two_alpha_weights(density, t_density, tdist, dirs, opaque_background=False):
+  """Helper function for computing alpha compositing weights."""
+  t_delta = tdist[..., 1:] - tdist[..., :-1]
+  delta = t_delta * jnp.linalg.norm(dirs[..., None, :], axis=-1)
+  density_delta = density * delta
+  t_density_delta = t_density * delta
+  sum_density_delta = (density + t_density) * delta
+
+
+  if opaque_background:
+    def background_process(d):
+      return jnp.concatenate([
+        d[..., :-1],
+        jnp.full_like(d[..., -1:], jnp.inf)], axis=-1)
+
+    # Equivalent to making the final t-interval infinitely wide.
+    density_delta = background_process(density_delta)
+    t_density_delta = background_process(t_density_delta)
+    sum_density_delta = background_process(sum_density_delta)
+
+  alpha = 1 - jnp.exp(-density_delta)
+  t_alpha = 1 - jnp.exp(-t_density_delta)
+
+  trans = jnp.exp(-jnp.concatenate([
+      jnp.zeros_like(sum_density_delta[..., :1]),
+      jnp.cumsum(sum_density_delta[..., :-1], axis=-1)
+  ],
+                                   axis=-1))
+
+  weights = alpha * trans
+  t_weights = t_alpha * trans
+  return weights, t_weights, alpha
+
+
 def volumetric_rendering(rgbs,
                          weights,
+                         t_weights,
                          tdist,
                          bg_rgbs,
                          t_far,
                          compute_extras,
-                         extras=None):
+                         extras=None,
+                         compute_transient=False,
+                         t_rgbs=None):
   """Volumetric Rendering Function.
 
   Args:
@@ -177,9 +214,16 @@ def volumetric_rendering(rgbs,
   rendering = {}
 
   acc = weights.sum(axis=-1)
-  bg_w = jnp.maximum(0, 1 - acc[..., None])  # The weight of the background.
-  rgb = (weights[..., None] * rgbs).sum(axis=-2) + bg_w * bg_rgbs
-  rendering['rgb'] = rgb
+  if compute_transient:
+    t_acc = t_weights.sum(axis=-1)
+    bg_w = jnp.maximum(0, 1 - acc[..., None] - t_acc[..., None])
+    rgb = (weights[..., None] * rgbs + t_weights[..., None] * t_rgbs).sum(axis=-2)
+  else:
+    bg_w = jnp.maximum(0, 1 - acc[..., None])
+    rgb = (weights[..., None] * rgbs).sum(axis=-2)
+
+  final_rgb = rgb+ bg_w * bg_rgbs
+  rendering['rgb'] = final_rgb
 
   if compute_extras:
     rendering['acc'] = acc
