@@ -68,7 +68,24 @@ def summarize_tree(tree, fn, ancestry=(), max_depth=3):
   return stats
 
 
-def compute_data_loss(batch, renderings, rays, config):
+def compute_beta_sq(ray_history, config):
+  last_ray_results = ray_history[-1]
+  beta = last_ray_results['transient']['beta']
+  beta = config.beta_min + jnp.log(1 + jnp.exp(beta))
+  return jnp.square(beta)
+
+
+def compute_second_term_loss(beta_sq):
+  return jnp.log(beta_sq).mean() / 2
+
+
+def compute_t_weight_regulazier_loss(ray_history, config):
+  last_ray_results = ray_history[-1]
+  loss = jnp.mean(last_ray_results['transient']['density'])
+  return config.lambda_loss_mult * loss
+
+
+def compute_data_loss(batch, renderings, rays, beta_sq, config):
   """Computes data loss terms for RGB, normal, and depth outputs."""
   data_losses = []
   stats = collections.defaultdict(lambda: [])
@@ -124,7 +141,7 @@ def compute_data_loss(batch, renderings, rays, config):
 
   data_losses = jnp.array(data_losses)
   loss = (
-      config.data_coarse_loss_mult * jnp.sum(data_losses[:-1]) +
+      config.data_coarse_loss_mult * jnp.sum(data_losses[:-1]) / (beta_sq.mean() *2) +
       config.data_loss_mult * data_losses[-1])
   stats = {k: jnp.array(stats[k]) for k in stats}
   return loss, stats
@@ -273,7 +290,12 @@ def create_train_step(model: models.Model,
 
       losses = {}
 
-      data_loss, stats = compute_data_loss(batch, renderings, rays, config)
+      beta_sq = compute_beta_sq(ray_history, config)
+
+      losses['second'] = compute_second_term_loss(beta_sq) + config.rho
+      losses['regulazier'] = compute_t_weight_regulazier_loss(ray_history, config)
+
+      data_loss, stats = compute_data_loss(batch, renderings, rays, beta_sq, config)
       losses['data'] = data_loss
 
       if config.interlevel_loss_mult > 0:
