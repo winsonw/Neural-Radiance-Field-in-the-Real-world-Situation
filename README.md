@@ -17,7 +17,7 @@ For the use of GPUs or TPUs, you need to visit https://github.com/google/jax for
 
 ## For model 1 training, rendering, and evaluation: 
 ```
-git checkout master
+git checkout main
 
 python -m train \
   --gin_configs=configs/360.gin \
